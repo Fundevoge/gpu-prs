@@ -7,6 +7,11 @@ struct Vec3
     float data[3];
 };
 
+struct Vec4
+{
+    float data[4];
+};
+
 struct Transform
 {
     float matrix[3][4]; // row-major
@@ -21,6 +26,35 @@ struct Transform
                                                  __fmaf_rn(matrix[i][2], vec->data[2],
                                                            matrix[i][3])));
         }
+        return result;
+    }
+};
+
+struct TransformQuat
+{
+    float scale;
+    Vec3 t;
+    Vec4 q;
+
+    __device__ Transform to_transform_matrix() const
+    {
+        float one = 1.;
+        float two = 2.;
+        Transform result = {.matrix{
+            {scale * (one - two * (q.data[2] * q.data[2] + q.data[3] * q.data[3])),
+             scale * (two * (q.data[1] * q.data[2] - q.data[3] * q.data[0])),
+             scale * (two * (q.data[1] * q.data[3] + q.data[2] * q.data[0])),
+             t.data[0]},
+            {scale * (two * (q.data[1] * q.data[2] + q.data[3] * q.data[0])),
+             scale * (one - two * (q.data[1] * q.data[1] + q.data[3] * q.data[3])),
+             scale * (two * (q.data[2] * q.data[3] - q.data[1] * q.data[0])),
+             t.data[1]},
+            {scale * (two * (q.data[1] * q.data[3] - q.data[2] * q.data[0])),
+             scale * (two * (q.data[2] * q.data[3] + q.data[1] * q.data[0])),
+             scale * (one - two * (q.data[1] * q.data[1] + q.data[2] * q.data[2])),
+             t.data[2]},
+        }};
+
         return result;
     }
 };

@@ -1,13 +1,13 @@
 #include "kernel.cuh"
 #include <cuda_runtime.h>
 
-extern "C" __global__ void run_task_kernel(Transform *obj_transforms, uint8_t *results, TaskStaticInfoGpu *static_info, int num_tasks)
+extern "C" __global__ void run_task_kernel(TransformQuat *obj_transforms, uint8_t *results, TaskStaticInfoGpu *static_info, int num_tasks)
 {
     uint32_t task_id = blockIdx.x * blockDim.x + threadIdx.x;
     if (task_id >= num_tasks)
         return;
 
-    const Transform &o_D_obj = obj_transforms[task_id];
+    const Transform o_D_obj = obj_transforms[task_id].to_transform_matrix();
 
     for (uint32_t idx = 0; idx < static_info->num_indices; ++idx)
     {

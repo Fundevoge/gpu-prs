@@ -1,8 +1,4 @@
-use std::{
-    ffi::CString,
-    sync::mpsc::{Receiver, Sender},
-    time::Instant,
-};
+use std::{ffi::CString, time::Instant};
 
 use cust::{
     memory::DeviceCopy,
@@ -10,7 +6,7 @@ use cust::{
     prelude::*,
 };
 
-use crate::{Transform, U32_3, VoxelGrid};
+use crate::{Transform, TransformQuat, U32_3, VoxelGrid};
 
 pub(crate) struct TaskStaticInfo {
     pub(crate) transform_into_1: Transform,
@@ -37,20 +33,10 @@ struct VoxelGridGpu {
     dims: U32_3,
 }
 
-struct TaskDynamicInfo {
-    transform_from_obj: Transform,
-    tag: u64,
-}
-
-struct TaskCompletion {
-    collision: bool,
-    tag: u64,
-}
-
 pub(crate) fn gpu_driver(
     task_static_info: TaskStaticInfo,
-    // in_queue: Receiver<TaskDynamicInfo>,
-    // out_queue: Sender<TaskCompletion>,
+    input: &[TransformQuat],
+    output: &mut [u8],
 ) {
     let _ctx = cust::quick_init().unwrap();
     let ptx = CString::new(include_str!("../kernel/kernel.ptx")).unwrap();
@@ -84,32 +70,22 @@ pub(crate) fn gpu_driver(
 
     let collision_kernel = module.get_function("run_task_kernel").unwrap();
 
-    let collision_buffer: DeviceBuffer<u8> = DeviceBuffer::from_slice(&[255]).unwrap();
-
-    let transforms_gpu = Transform::from_homogeneous_and_scale(
-        crate::Matrix34([
-            [0.99884413, -0.00170316, 0.04803638, 0.0],
-            [0.00386124, -0.9932992, -0.11550674, 0.0],
-            [0.04791122, 0.11555871, -0.9921445, 0.0805],
-        ]),
-        5.004186e-4,
-    )
-    .as_dbox()
-    .unwrap();
+    let collision_buffer: DeviceBuffer<u8> =
+        unsafe { DeviceBuffer::uninitialized(output.len()) }.unwrap();
+    let transforms_buffer: DeviceBuffer<TransformQuat> = DeviceBuffer::from_slice(input).unwrap();
 
     let start = Instant::now();
 
     unsafe {
         launch!(collision_kernel<<<1, 1, 0, stream>>>(
-            transforms_gpu.as_device_ptr(), collision_buffer.as_device_ptr(), task_static_info_gpu_box.as_device_ptr(), 1
+            transforms_buffer.as_device_ptr(), collision_buffer.as_device_ptr(), task_static_info_gpu_box.as_device_ptr(), 1
         ))
     }
     .unwrap();
 
     stream.synchronize().unwrap();
     let duration = start.elapsed();
+    println!("GPU time: {duration:?}");
 
-    let mut collision: [u8; 1] = [127];
-    collision_buffer.copy_to(&mut collision).unwrap();
-    println!("Collision: {}; time: {:?}", collision[0], duration);
+    collision_buffer.copy_to(output).unwrap();
 }

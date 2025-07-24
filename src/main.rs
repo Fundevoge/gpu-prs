@@ -184,6 +184,96 @@ impl Transform {
 
 #[repr(C)]
 #[derive(Clone, Copy, Default, DeviceCopy)]
+struct TransformQuat {
+    scale: f32,
+    t: Vec3,
+    q: Vec4,
+}
+
+impl TransformQuat {
+    fn from_transform(transform: &Transform) -> Self {
+        let scale: f32 = scalar_product(
+            transform.matrix.0[0][0..3].iter(),
+            transform.matrix.0[0][0..3].iter(),
+        )
+        .sqrt();
+        let cos_theta =
+            ((transform.matrix.0[0][0] + transform.matrix.0[1][1] + transform.matrix.0[2][2])
+                / scale
+                - 1.)
+                / 2.;
+        let theta = cos_theta.clamp(-1., 1.).acos();
+        let axis = Vec3([
+            transform.matrix.0[2][1] - transform.matrix.0[1][2],
+            transform.matrix.0[0][2] - transform.matrix.0[2][0],
+            transform.matrix.0[1][0] - transform.matrix.0[0][1],
+        ]);
+        let axis_norm = axis.norm();
+        let axis = if axis_norm > 5e-5 {
+            axis.scale((theta / 2.).sin() / axis_norm)
+        } else {
+            Vec3::default()
+        };
+
+        let q = Vec4([(theta / 2.).cos(), axis.0[0], axis.0[1], axis.0[2]]);
+
+        Self {
+            t: transform.homogeneous_translation(),
+            q,
+            scale,
+        }
+    }
+
+    // Assumes equal scale; will use self.scale
+    fn interpolate<const N: usize>(&self, other: &TransformQuat) -> [TransformQuat; N] {
+        let mut result = [TransformQuat::default(); N];
+        result[N - 1] = *other;
+        if N == 1 {
+            return result;
+        }
+        let step_size = 1. / (N as f32);
+        let dt = other.t.subtract(self.t).scale(step_size);
+
+        let q0 = self.q;
+        let qn = other.q;
+
+        let qn_1 = slerp(q0, qn, (N as f32 - 1.) * step_size);
+
+        let mut t_curr = other.t.subtract(dt);
+
+        result[N - 2] = TransformQuat {
+            scale: self.scale,
+            t: t_curr,
+            q: qn_1,
+        };
+
+        if N == 2 {
+            return result;
+        }
+
+        let mut q_prev = qn;
+        let mut q_curr = qn_1;
+
+        let c = 2.0 * qn_1.dot(qn);
+        for i in (0..(N - 2)).rev() {
+            let q_next = q_curr.scale(c).subtract(q_prev).normalize();
+            t_curr = t_curr.subtract(dt);
+
+            q_prev = q_curr;
+            q_curr = q_next;
+
+            result[i] = TransformQuat {
+                scale: self.scale,
+                t: t_curr,
+                q: q_curr,
+            };
+        }
+        result
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default, DeviceCopy)]
 struct Matrix34([[f32; 4]; 3]);
 
 #[repr(C)]
@@ -191,14 +281,91 @@ struct Matrix34([[f32; 4]; 3]);
 struct Matrix3([[f32; 3]; 3]);
 
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, DeviceCopy)]
 struct Vec3([f32; 3]);
+
+#[repr(C)]
+#[derive(Clone, Copy, Default, DeviceCopy)]
+struct Vec4([f32; 4]);
+
+impl Vec4 {
+    fn inverse(self) -> Self {
+        self.scale(-1.)
+    }
+
+    fn subtract(mut self, other: Vec4) -> Vec4 {
+        self.0[0] -= other.0[0];
+        self.0[1] -= other.0[1];
+        self.0[2] -= other.0[2];
+        self.0[3] -= other.0[3];
+        self
+    }
+
+    fn add(mut self, other: Vec4) -> Vec4 {
+        self.0[0] += other.0[0];
+        self.0[1] += other.0[1];
+        self.0[2] += other.0[2];
+        self.0[3] += other.0[3];
+        self
+    }
+
+    fn norm(self) -> f32 {
+        self.dot(self).sqrt()
+    }
+
+    fn dot(self, other: Self) -> f32 {
+        scalar_product(self.0.iter(), other.0.iter())
+    }
+
+    fn normalize(self) -> Self {
+        let norm = self.norm();
+        self.scale(1. / norm)
+    }
+
+    fn scale(mut self, scale: f32) -> Self {
+        self.0[0] *= scale;
+        self.0[1] *= scale;
+        self.0[2] *= scale;
+        self.0[3] *= scale;
+        self
+    }
+}
 
 fn scalar_product<'a>(
     a_s: impl Iterator<Item = &'a f32>,
     b_s: impl Iterator<Item = &'a f32>,
 ) -> f32 {
     a_s.zip(b_s).map(|(a, b)| *a * *b).sum()
+}
+
+fn slerp(q0: Vec4, q1: Vec4, t: f32) -> Vec4 {
+    let mut dot = q0.dot(q1);
+
+    let mut q1_mod = q1;
+
+    // Ensure shortest path
+    if dot < 0.0 {
+        q1_mod = q1_mod.scale(-1.0);
+        dot = -dot;
+    }
+
+    const DOT_THRESHOLD: f32 = 0.9995;
+    if dot > DOT_THRESHOLD {
+        // Use LERP and normalize
+        let lerped = q0.scale(1.0 - t).add(q1_mod.scale(t));
+        return lerped.normalize();
+    }
+
+    let theta_0 = dot.acos(); // initial angle
+    let sin_theta_0 = theta_0.sin();
+
+    let theta = theta_0 * t;
+    let sin_theta = theta.sin();
+
+    let s0 = (theta_0 - theta).sin() / sin_theta_0;
+    let s1 = sin_theta / sin_theta_0;
+
+    q0.scale(s0).add(q1_mod.scale(s1))
 }
 
 impl Matrix3 {
@@ -222,12 +389,38 @@ impl Matrix34 {
 }
 
 impl Vec3 {
-    fn inverse(&self) -> Self {
-        let mut new = Vec3(self.0);
-        new.0[0] *= -1.;
-        new.0[1] *= -1.;
-        new.0[2] *= -1.;
-        new
+    fn inverse(self) -> Self {
+        self.scale(-1.)
+    }
+
+    fn subtract(mut self, other: Vec3) -> Vec3 {
+        self.0[0] -= other.0[0];
+        self.0[1] -= other.0[1];
+        self.0[2] -= other.0[2];
+        self
+    }
+
+    fn add(mut self, other: Vec3) -> Vec3 {
+        self.0[0] += other.0[0];
+        self.0[1] += other.0[1];
+        self.0[2] += other.0[2];
+        self
+    }
+
+    fn norm(self) -> f32 {
+        scalar_product(self.0.iter(), self.0.iter()).sqrt()
+    }
+
+    fn normalize(self) -> Self {
+        let norm = self.norm();
+        self.scale(1. / norm)
+    }
+
+    fn scale(mut self, scale: f32) -> Self {
+        self.0[0] *= scale;
+        self.0[1] *= scale;
+        self.0[2] *= scale;
+        self
     }
 }
 
@@ -345,13 +538,121 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let collision = unsafe { *task.out_collision };
     println!("Collision {collision} Time taken: {duration:?}");
 
-    glue::gpu_driver(glue::TaskStaticInfo {
-        transform_into_1: task.transform_into_1,
-        transform_into_2: task.transform_into_2,
-        index_list_obj: index_list,
-        num_indices: task.num_indices,
-        voxel_grid: task.grid_static,
-    });
+    let mut gpu_out = [255];
+    glue::gpu_driver(
+        glue::TaskStaticInfo {
+            transform_into_1: task.transform_into_1,
+            transform_into_2: task.transform_into_2,
+            index_list_obj: index_list,
+            num_indices: task.num_indices,
+            voxel_grid: task.grid_static,
+        },
+        &[TransformQuat::from_transform(&transform_from_obj)],
+        &mut gpu_out,
+    );
+    println!("GPU returned collision {}", gpu_out[0]);
 
     Ok(())
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    fn quat_to_rot_matrix(q: &Vec4) -> Matrix3 {
+        Matrix3([
+            [
+                1. - 2. * (q.0[2] * q.0[2] + q.0[3] * q.0[3]),
+                2. * (q.0[1] * q.0[2] - q.0[3] * q.0[0]),
+                2. * (q.0[1] * q.0[3] + q.0[2] * q.0[0]),
+            ],
+            [
+                2. * (q.0[1] * q.0[2] + q.0[3] * q.0[0]),
+                1. - 2. * (q.0[1] * q.0[1] + q.0[3] * q.0[3]),
+                2. * (q.0[2] * q.0[3] - q.0[1] * q.0[0]),
+            ],
+            [
+                2. * (q.0[1] * q.0[3] - q.0[2] * q.0[0]),
+                2. * (q.0[2] * q.0[3] + q.0[1] * q.0[0]),
+                1. - 2. * (q.0[1] * q.0[1] + q.0[2] * q.0[2]),
+            ],
+        ])
+    }
+
+    #[test]
+    fn test_quaternion_conersion() {
+        let m = Matrix34([
+            [0.99884413, -0.00170316, 0.04803638, 0.],
+            [0.00386124, -0.9932992, -0.11550674, 0.],
+            [0.04791122, 0.11555871, -0.9921445, 0.],
+        ]);
+        let d = Transform::from_homogeneous_and_scale(m, 1.);
+        let m_recovered = quat_to_rot_matrix(&TransformQuat::from_transform(&d).q);
+        for i in 0..3 {
+            for j in 0..3 {
+                assert!(
+                    (m_recovered.0[i][j] - m.0[i][j]).abs() < 5e-5,
+                    "Matrix Quaternion conversion failed at index {i} {j}\n{:?}\n{:?}",
+                    m.0,
+                    m_recovered.0
+                );
+            }
+        }
+
+        let m = Matrix34([[1., 0., 0., 0.], [0., 1., 0., 0.], [0., 0., 1., 0.]]);
+        let d = Transform::from_homogeneous_and_scale(m, 1.);
+        let m_recovered = quat_to_rot_matrix(&TransformQuat::from_transform(&d).q);
+        for i in 0..3 {
+            for j in 0..3 {
+                assert!(
+                    (m_recovered.0[i][j] - m.0[i][j]).abs() < 5e-5,
+                    "Matrix Quaternion conversion failed at index {i} {j}\n{:?}\n{:?}",
+                    m.0,
+                    m_recovered.0
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_quaternion_interpolation() {
+        let scale = 0.1;
+        let r3_2 = 3.0_f32.sqrt() / 2.;
+        let m0 = Matrix34([[1., 0., 0., 0.], [0., 1., 0., 0.], [0., 0., 1., 0.]]);
+        let m1 = Matrix34([[r3_2, -0.5, 0., 1.], [0.5, r3_2, 0., 2.], [0., 0., 1., 3.]]);
+        let m2 = Matrix34([[0.5, -r3_2, 0., 2.], [r3_2, 0.5, 0., 4.], [0., 0., 1., 6.]]);
+        let m3 = Matrix34([[0., -1., 0., 3.], [1., 0., 0., 6.], [0., 0., 1., 9.]]);
+        let tq0 = TransformQuat::from_transform(&Transform::from_homogeneous_and_scale(m0, scale));
+        let tq1 = TransformQuat::from_transform(&Transform::from_homogeneous_and_scale(m1, scale));
+        let tq2 = TransformQuat::from_transform(&Transform::from_homogeneous_and_scale(m2, scale));
+        let tq3 = TransformQuat::from_transform(&Transform::from_homogeneous_and_scale(m3, scale));
+
+        let interps: [TransformQuat; 3] = tq0.interpolate(&tq3);
+
+        for (i, (interp, sol)) in interps.iter().zip([tq1, tq2, tq3]).enumerate() {
+            for (j, (q_interp, q_sol)) in interp.q.0.iter().zip(sol.q.0.iter()).enumerate() {
+                assert!(
+                    (q_interp - q_sol).abs() < 5e-5,
+                    "Interpolation failed for step {}, index {j}, quat interp {:?} vs sol {:?}",
+                    i + 1,
+                    interp.q.0,
+                    sol.q.0
+                );
+            }
+            for (j, (t_interp, t_sol)) in interp.t.0.iter().zip(sol.t.0.iter()).enumerate() {
+                assert!(
+                    (t_interp - t_sol).abs() < 5e-5,
+                    "Interpolation failed for step {}, index {j}, vec interp {:?} vs sol {:?}",
+                    i + 1,
+                    interp.t.0,
+                    sol.t.0
+                );
+            }
+            assert_eq!(
+                interp.scale, sol.scale,
+                "Scale wrong for Transform {i}: interp {:?} vs sol {:?}",
+                interp.scale, sol.scale
+            );
+        }
+    }
 }
