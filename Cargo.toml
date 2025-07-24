@@ -1,0 +1,12 @@
+[package]
+name = "gpu-prs"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+cust = "0.3.2"                                         # CUDA FFI crate
+bytemuck = "1.13"
+npyz = "0.8.4"
+serde_json = "1.0.141"
+serde = { version = "1.0.219", features = ["derive"] }
+cust_raw = "0.11.3"
