@@ -1,0 +1,68 @@
+{
+    "voxel_grid_obj_path": "./index_list.npy", // Has to be Row order (C-Style)
+    "voxel_grid_fixed_path": "./occupancy_grid.npy", // Has to be Row order (C-Style)
+    "o_S_x": 0.1,
+    "o_Ds_x": [
+        [
+            [
+                1,
+                0,
+                0,
+                0
+            ],
+            [
+                0,
+                1,
+                0,
+                0
+            ],
+            [
+                0,
+                0,
+                1,
+                0
+            ]
+        ],
+        [
+            [
+                1,
+                0,
+                0,
+                0
+            ],
+            [
+                0,
+                1,
+                0,
+                0
+            ],
+            [
+                0,
+                0,
+                1,
+                0
+            ]
+        ]
+    ],
+    "o_D_obj": [
+        [
+            1,
+            0,
+            0,
+            0
+        ],
+        [
+            0,
+            1,
+            0,
+            0
+        ],
+        [
+            0,
+            0,
+            1,
+            0
+        ]
+    ]
+]
+}
