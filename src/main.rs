@@ -306,7 +306,7 @@ fn run_task(task: &mut Task) {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let config = load_json_config("/home/linus/prg/gpu_path_planner/gpu-prs/scenes/scene_1.json")?;
+    let config = load_json_config("./scenes/scene_1.json")?;
 
     let scale = config.o_S_x;
     println!("o_S_x: {scale}");
