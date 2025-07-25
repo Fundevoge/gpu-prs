@@ -1,11 +1,15 @@
 use core::slice;
-use std::{fs::File, io::Read, ops::Index, path::Path, time::Instant};
+use std::{array, fs::File, io::Read, ops::Index, path::Path, time::Instant};
 
 use cust::DeviceCopy;
 use npyz::NpyFile;
+use probability::prelude::Sample;
 use serde::Deserialize;
 
+use crate::math::{Matrix3, Matrix34, U32_3, Vec3, Vec4};
+
 mod glue;
+mod math;
 
 #[allow(non_snake_case)]
 #[derive(Debug, Deserialize)]
@@ -69,30 +73,6 @@ fn read_index_list<P: AsRef<Path>>(path: P) -> Result<Vec<U32_3>, Box<dyn std::e
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Default, Debug, DeviceCopy)]
-struct U32_3 {
-    x: u32,
-    y: u32,
-    z: u32,
-}
-
-impl From<[u32; 3]> for U32_3 {
-    fn from(val: [u32; 3]) -> Self {
-        U32_3 {
-            x: val[0],
-            y: val[1],
-            z: val[2],
-        }
-    }
-}
-
-impl U32_3 {
-    fn as_array(&self) -> [u32; 3] {
-        [self.x, self.y, self.z]
-    }
-}
-
-#[repr(C)]
 #[derive(Clone, Copy)]
 struct VoxelGrid {
     data: *const u8,
@@ -125,12 +105,6 @@ struct Transform {
 }
 
 impl Transform {
-    // fn and_then(&self, other: &Transform) -> Transform {
-    //     Transform {
-    //         matrix: self.matrix.multiply_from_left(&other.matrix),
-    //     }
-    // }
-
     fn apply(self, v: &Vec3) -> Vec3 {
         self.matrix.multiply_vec_from_right(v)
     }
@@ -167,7 +141,7 @@ impl Transform {
     fn inverse(&self) -> Self {
         let mut new_rotation_matrix = Matrix3::default();
         let o_S_x_2: f32 =
-            scalar_product(self.matrix.0[0][0..3].iter(), self.matrix.0[0][0..3].iter());
+            math::scalar_product(self.matrix.0[0][0..3].iter(), self.matrix.0[0][0..3].iter());
 
         for i in 0..3 {
             for j in 0..3 {
@@ -183,7 +157,7 @@ impl Transform {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Default, DeviceCopy)]
+#[derive(Clone, Copy, Default, DeviceCopy, Debug)]
 struct TransformQuat {
     scale: f32,
     t: Vec3,
@@ -192,7 +166,7 @@ struct TransformQuat {
 
 impl TransformQuat {
     fn from_transform(transform: &Transform) -> Self {
-        let scale: f32 = scalar_product(
+        let scale: f32 = math::scalar_product(
             transform.matrix.0[0][0..3].iter(),
             transform.matrix.0[0][0..3].iter(),
         )
@@ -237,7 +211,7 @@ impl TransformQuat {
         let q0 = self.q;
         let qn = other.q;
 
-        let qn_1 = slerp(q0, qn, (N as f32 - 1.) * step_size);
+        let qn_1 = math::slerp(q0, qn, (N as f32 - 1.) * step_size);
 
         let mut t_curr = other.t.subtract(dt);
 
@@ -269,158 +243,6 @@ impl TransformQuat {
             };
         }
         result
-    }
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Default, DeviceCopy)]
-struct Matrix34([[f32; 4]; 3]);
-
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
-struct Matrix3([[f32; 3]; 3]);
-
-#[repr(C)]
-#[derive(Clone, Copy, Default, DeviceCopy)]
-struct Vec3([f32; 3]);
-
-#[repr(C)]
-#[derive(Clone, Copy, Default, DeviceCopy)]
-struct Vec4([f32; 4]);
-
-impl Vec4 {
-    fn inverse(self) -> Self {
-        self.scale(-1.)
-    }
-
-    fn subtract(mut self, other: Vec4) -> Vec4 {
-        self.0[0] -= other.0[0];
-        self.0[1] -= other.0[1];
-        self.0[2] -= other.0[2];
-        self.0[3] -= other.0[3];
-        self
-    }
-
-    fn add(mut self, other: Vec4) -> Vec4 {
-        self.0[0] += other.0[0];
-        self.0[1] += other.0[1];
-        self.0[2] += other.0[2];
-        self.0[3] += other.0[3];
-        self
-    }
-
-    fn norm(self) -> f32 {
-        self.dot(self).sqrt()
-    }
-
-    fn dot(self, other: Self) -> f32 {
-        scalar_product(self.0.iter(), other.0.iter())
-    }
-
-    fn normalize(self) -> Self {
-        let norm = self.norm();
-        self.scale(1. / norm)
-    }
-
-    fn scale(mut self, scale: f32) -> Self {
-        self.0[0] *= scale;
-        self.0[1] *= scale;
-        self.0[2] *= scale;
-        self.0[3] *= scale;
-        self
-    }
-}
-
-fn scalar_product<'a>(
-    a_s: impl Iterator<Item = &'a f32>,
-    b_s: impl Iterator<Item = &'a f32>,
-) -> f32 {
-    a_s.zip(b_s).map(|(a, b)| *a * *b).sum()
-}
-
-fn slerp(q0: Vec4, q1: Vec4, t: f32) -> Vec4 {
-    let mut dot = q0.dot(q1);
-
-    let mut q1_mod = q1;
-
-    // Ensure shortest path
-    if dot < 0.0 {
-        q1_mod = q1_mod.scale(-1.0);
-        dot = -dot;
-    }
-
-    const DOT_THRESHOLD: f32 = 0.9995;
-    if dot > DOT_THRESHOLD {
-        // Use LERP and normalize
-        let lerped = q0.scale(1.0 - t).add(q1_mod.scale(t));
-        return lerped.normalize();
-    }
-
-    let theta_0 = dot.acos(); // initial angle
-    let sin_theta_0 = theta_0.sin();
-
-    let theta = theta_0 * t;
-    let sin_theta = theta.sin();
-
-    let s0 = (theta_0 - theta).sin() / sin_theta_0;
-    let s1 = sin_theta / sin_theta_0;
-
-    q0.scale(s0).add(q1_mod.scale(s1))
-}
-
-impl Matrix3 {
-    fn multiply_vec_from_right(&self, v: &Vec3) -> Vec3 {
-        let mut new = Vec3::default();
-        for i in 0..3 {
-            new.0[i] = scalar_product(self.0[i].iter(), v.0.iter());
-        }
-        new
-    }
-}
-
-impl Matrix34 {
-    fn multiply_vec_from_right(&self, v: &Vec3) -> Vec3 {
-        let mut new = Vec3::default();
-        for i in 0..3 {
-            new.0[i] = scalar_product(self.0[i].iter(), v.0.iter()) + self.0[i][3];
-        }
-        new
-    }
-}
-
-impl Vec3 {
-    fn inverse(self) -> Self {
-        self.scale(-1.)
-    }
-
-    fn subtract(mut self, other: Vec3) -> Vec3 {
-        self.0[0] -= other.0[0];
-        self.0[1] -= other.0[1];
-        self.0[2] -= other.0[2];
-        self
-    }
-
-    fn add(mut self, other: Vec3) -> Vec3 {
-        self.0[0] += other.0[0];
-        self.0[1] += other.0[1];
-        self.0[2] += other.0[2];
-        self
-    }
-
-    fn norm(self) -> f32 {
-        scalar_product(self.0.iter(), self.0.iter()).sqrt()
-    }
-
-    fn normalize(self) -> Self {
-        let norm = self.norm();
-        self.scale(1. / norm)
-    }
-
-    fn scale(mut self, scale: f32) -> Self {
-        self.0[0] *= scale;
-        self.0[1] *= scale;
-        self.0[2] *= scale;
-        self
     }
 }
 
@@ -498,6 +320,44 @@ fn run_task(task: &mut Task) {
     unsafe { *task.out_collision = 0 };
 }
 
+fn random_sampling(
+    transform_from_obj: &Transform,
+    out_buffer: &mut [TransformQuat],
+    max_angle: f64,
+    max_distance: f64,
+    source: &mut impl probability::source::Source,
+) {
+    let base_transform_quat = TransformQuat::from_transform(transform_from_obj);
+    let base_quat = base_transform_quat.q;
+    let base_vec = base_transform_quat.t;
+
+    for out in out_buffer {
+        let std_gaussian = probability::distribution::Gaussian::new(0., 1.);
+        let uniform_angle = probability::distribution::Uniform::new(-max_angle, max_angle);
+        let uniform_distance = probability::distribution::Uniform::new(0., max_distance);
+        // Sample random axis (point on 2d sphere) + random axis => apply to base_transform_quat to get final orientation
+        let random_axis = Vec3(array::from_fn(|_| std_gaussian.sample(source) as f32)).normalize();
+        let random_angle = uniform_angle.sample(source);
+        let random_quat = Vec4::quat_from_unit_axis_angle(random_axis, random_angle);
+        // Apply to base_transform (quat)
+        let new_quat = random_quat.quat_multiply(base_quat);
+
+        // Sample random vector
+        let random_translation = Vec3(array::from_fn(|_| std_gaussian.sample(source) as f32))
+            .normalize()
+            .scale(uniform_distance.sample(source) as f32)
+            .add(base_vec);
+
+        let new_transform_quat = TransformQuat {
+            scale: base_transform_quat.scale,
+            t: random_translation,
+            q: new_quat,
+        };
+        //println!("Old: {base_transform_quat:?}, New: {new_transform_quat:?}");
+        *out = new_transform_quat;
+    }
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = load_json_config("./scenes/scene_1.json")?;
 
@@ -538,19 +398,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let collision = unsafe { *task.out_collision };
     println!("Collision {collision} Time taken: {duration:?}");
 
-    let mut gpu_out = [255];
-    glue::gpu_driver(
-        glue::TaskStaticInfo {
-            transform_into_1: task.transform_into_1,
-            transform_into_2: task.transform_into_2,
-            index_list_obj: index_list,
-            num_indices: task.num_indices,
-            voxel_grid: task.grid_static,
-        },
-        &[TransformQuat::from_transform(&transform_from_obj)],
-        &mut gpu_out,
+    let static_info = glue::TaskStaticInfo {
+        transform_into_1: task.transform_into_1,
+        transform_into_2: task.transform_into_2,
+        index_list_obj: index_list,
+        num_indices: task.num_indices,
+        voxel_grid: task.grid_static,
+    };
+
+    let mut rng_source =
+        probability::source::Default::new([3589646354398292094, 6717470606376064352]);
+
+    const N: usize = 10240 * 2;
+    let mut gpu_input_buffer_cpu = [TransformQuat::default(); N];
+    let mut gpu_output_buffer_cpu = [255_u8; N];
+
+    random_sampling(
+        &transform_from_obj,
+        &mut gpu_input_buffer_cpu,
+        0.005,
+        0.0001,
+        &mut rng_source,
     );
-    println!("GPU returned collision {}", gpu_out[0]);
+
+    let mut device_buffers = glue::setup_gpu(&static_info, N);
+
+    glue::gpu_driver(
+        &mut device_buffers,
+        &gpu_input_buffer_cpu, // &[TransformQuat::from_transform(&transform_from_obj)],
+        &mut gpu_output_buffer_cpu,
+    );
+    println!("GPU returned collision {gpu_output_buffer_cpu:?}");
 
     Ok(())
 }

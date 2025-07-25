@@ -167,6 +167,7 @@ dependencies = [
  "cust",
  "cust_raw",
  "npyz",
+ "probability",
  "serde",
  "serde_json",
 ]
@@ -295,6 +296,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "probability"
+version = "0.20.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "42746b805e424b759d46c22c65dc66ccca057a2db96e9db4fda6c337a287e485"
+dependencies = [
+ "random",
+ "special",
+]
+
+[[package]]
 name = "proc-macro2"
 version = "1.0.95"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -324,6 +335,12 @@ checksum = "1885c039570dc00dcb4ff087a89e185fd56bae234ddc7f056a945bf36467248d"
 dependencies = [
  "proc-macro2",
 ]
+
+[[package]]
+name = "random"
+version = "0.13.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "474c42c904f04dfe2a595a02f71e1a0e5e92ffb5761cc9a4c02140b93b8dd504"
 
 [[package]]
 name = "rustc_version"
@@ -387,6 +404,15 @@ dependencies = [
  "cfg-if",
  "cpufeatures",
  "digest",
+]
+
+[[package]]
+name = "special"
+version = "0.10.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b89cf0d71ae639fdd8097350bfac415a41aabf1d5ddd356295fdc95f09760382"
+dependencies = [
+ "libm",
 ]
 
 [[package]]
