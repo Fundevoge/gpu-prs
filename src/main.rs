@@ -1,9 +1,9 @@
-use core::slice;
+use core::{f64, slice};
 use std::{array, fs::File, io::Read, ops::Index, path::Path, time::Instant};
 
 use cust::DeviceCopy;
 use npyz::NpyFile;
-use probability::prelude::Sample;
+use probability::prelude::{Sample, Uniform};
 use serde::Deserialize;
 
 use crate::math::{Matrix3, Matrix34, U32_3, Vec3, Vec4};
@@ -19,6 +19,24 @@ struct Config {
     o_S_x: f32,
     o_D_obj: [[f32; 4]; 3],
     o_Ds_x: Vec<[[f32; 4]; 3]>,
+    rrt_info: RRTInfo,
+}
+#[derive(Debug, Deserialize)]
+struct StepSize {
+    angle: f32,
+    distance: f32,
+}
+#[derive(Debug, Deserialize)]
+struct Bounds {
+    min: [f32; 3],
+    max: [f32; 3],
+}
+#[derive(Debug, Deserialize)]
+struct RRTInfo {
+    angle_distance_tradeoff: f32,
+    pos_bounds: Bounds,
+    step_size: StepSize,
+    n_interp_steps: usize,
 }
 
 fn load_json_config<P: AsRef<Path>>(path: P) -> Result<Config, Box<dyn std::error::Error>> {
@@ -209,51 +227,57 @@ impl TransformQuat {
         }
     }
 
+    fn distances(&self, point: Vec3, quat: Vec4) -> (f32, f32) {
+        (
+            self.t.euclidean_distance(point),
+            self.q.quat_relative_angle(quat),
+        )
+    }
+
     // Assumes equal scale; will use self.scale
-    fn interpolate<const N: usize>(&self, other: &TransformQuat) -> [TransformQuat; N] {
-        let mut result = [TransformQuat::default(); N];
-        result[N - 1] = *other;
-        if N == 1 {
-            return result;
+    fn interpolate(&self, other: &TransformQuat, out_buffer: &mut [TransformQuat]) {
+        let n = out_buffer.len();
+        out_buffer[n - 1] = *other;
+        if n == 1 {
+            return;
         }
-        let step_size = 1. / (N as f32);
+        let step_size = 1. / (n as f32);
         let dt = other.t.subtract(self.t).scale(step_size);
 
         let q0 = self.q;
         let qn = other.q;
 
-        let qn_1 = math::slerp(q0, qn, (N as f32 - 1.) * step_size);
+        let qn_1 = math::slerp(q0, qn, ((n - 1) as f32) * step_size);
 
         let mut t_curr = other.t.subtract(dt);
 
-        result[N - 2] = TransformQuat {
+        out_buffer[n - 2] = TransformQuat {
             scale: self.scale,
             t: t_curr,
             q: qn_1,
         };
 
-        if N == 2 {
-            return result;
+        if n == 2 {
+            return;
         }
 
         let mut q_prev = qn;
         let mut q_curr = qn_1;
 
         let c = 2.0 * qn_1.dot(qn);
-        for i in (0..(N - 2)).rev() {
+        for i in (0..(n - 2)).rev() {
             let q_next = q_curr.scale(c).subtract(q_prev).normalize();
             t_curr = t_curr.subtract(dt);
 
             q_prev = q_curr;
             q_curr = q_next;
 
-            result[i] = TransformQuat {
+            out_buffer[i] = TransformQuat {
                 scale: self.scale,
                 t: t_curr,
                 q: q_curr,
             };
         }
-        result
     }
 }
 
@@ -336,14 +360,11 @@ fn random_sampling(
     let base_quat = base_transform_quat.q;
     let base_vec = base_transform_quat.t;
 
+    let std_gaussian = probability::distribution::Gaussian::default();
+    let angle_distribution_uniform = probability::distribution::Uniform::new(-max_angle, max_angle);
+    let uniform_distance = probability::distribution::Uniform::new(0., max_distance);
     for out in out_buffer {
-        let std_gaussian = probability::distribution::Gaussian::new(0., 1.);
-        let uniform_angle = probability::distribution::Uniform::new(-max_angle, max_angle);
-        let uniform_distance = probability::distribution::Uniform::new(0., max_distance);
-        // Sample random axis (point on 2d sphere) + random axis => apply to base_transform_quat to get final orientation
-        let random_axis = Vec3(array::from_fn(|_| std_gaussian.sample(source) as f32)).normalize();
-        let random_angle = uniform_angle.sample(source);
-        let random_quat = Vec4::quat_from_unit_axis_angle(random_axis, random_angle);
+        let random_quat = Vec4::random_quat(source, &angle_distribution_uniform);
         // Apply to base_transform (quat)
         let new_quat = random_quat.quat_multiply(base_quat);
 
@@ -353,14 +374,140 @@ fn random_sampling(
             .scale(uniform_distance.sample(source) as f32)
             .add(base_vec);
 
-        let new_transform_quat = TransformQuat {
+        *out = TransformQuat {
             scale: base_transform_quat.scale,
             t: random_translation,
             q: new_quat,
         };
-        //println!("Old: {base_transform_quat:?}, New: {new_transform_quat:?}");
-        *out = new_transform_quat;
     }
+}
+
+fn rrt(
+    nodes: &[TransformQuat],
+    info: &RRTInfo,
+    out_buffer: &mut [TransformQuat],
+    out_index_buffer: &mut [usize],
+    source: &mut impl probability::source::Source,
+) {
+    assert!(
+        out_buffer.len() % info.n_interp_steps == 0,
+        "Output buffer size {} should be divisible by number of interpolation steps {}",
+        out_buffer.len(),
+        info.n_interp_steps,
+    );
+    assert!(
+        out_buffer.len() / info.n_interp_steps == out_index_buffer.len(),
+        "Output buffer size {} and Output index buffer size {} should be related by number of interpolation steps {}",
+        out_buffer.len(),
+        out_index_buffer.len(),
+        info.n_interp_steps,
+    );
+    assert!(!nodes.is_empty(), "At least one starting node is necesary.");
+
+    let angle_distribution_uniform_full =
+        Uniform::new(-f64::consts::PI + 1e-4, f64::consts::PI - 1e-4);
+    let point_dists = [
+        Uniform::new(info.pos_bounds.min[0] as f64, info.pos_bounds.max[0] as f64),
+        Uniform::new(info.pos_bounds.min[1] as f64, info.pos_bounds.max[1] as f64),
+        Uniform::new(info.pos_bounds.min[2] as f64, info.pos_bounds.max[2] as f64),
+    ];
+
+    for i in 0..(out_buffer.len() / info.n_interp_steps) {
+        // Sample
+        let random_quat = Vec4::random_quat(source, &angle_distribution_uniform_full);
+        let random_point = Vec3(array::from_fn(|i| point_dists[i].sample(source) as f32));
+        // Find nearest
+        let (idx_min_node, min_node, (d_r, d_phi)) = nodes
+            .iter()
+            .enumerate()
+            .map(|(i, t)| (i, t, t.distances(random_point, random_quat)))
+            .min_by(
+                |&(_i1, _t1, (d_r_1, d_phi_1)), &(_i2, _t2, (d_r_2, d_phi_2))| {
+                    f32::total_cmp(
+                        &(d_r_1 + d_phi_1 * info.angle_distance_tradeoff),
+                        &(d_r_2 + d_phi_2 * info.angle_distance_tradeoff),
+                    )
+                },
+            )
+            .unwrap();
+        // Ensure maximum step size is respected
+        let target_quat = if d_phi <= info.step_size.angle {
+            random_quat
+        } else {
+            math::slerp(min_node.q, random_quat, info.step_size.angle / d_phi)
+        };
+        let target_pos = if d_r <= info.step_size.distance {
+            random_point
+        } else {
+            math::lerp(min_node.t, random_point, info.step_size.distance / d_r)
+        };
+
+        min_node.interpolate(
+            &TransformQuat {
+                scale: min_node.scale,
+                t: target_pos,
+                q: target_quat,
+            },
+            &mut out_buffer[i * info.n_interp_steps..(i + 1) * info.n_interp_steps],
+        );
+        out_index_buffer[i] = idx_min_node;
+    }
+}
+
+fn process_rrt_results(
+    processed_transforms: &[TransformQuat],
+    collisions: &[u8],
+    nodes: &mut Vec<TransformQuat>,
+    edges: &mut Vec<(usize, usize)>,
+    processing_transforms_base_node_indices: &[usize],
+    n_interp_steps: usize,
+) {
+    let mut n_coll_free = 0;
+    let mut n_coll_free_steps = 0;
+    let mut max_coll_free_steps = 0;
+    // Go through collisions in chunks of n_interp_steps
+    // Filter for those with at least one valid step
+    for (i, (colls, trs)) in collisions
+        .chunks(n_interp_steps)
+        .zip(processed_transforms.chunks(n_interp_steps))
+        .filter(|(c, _t)| c[0] == 0)
+        .enumerate()
+    {
+        // Count how many until collision
+        let index_last_collision_free = colls.iter().skip(1).take_while(|c| **c == 0).count();
+
+        // add final transform to nodes and edge to edges
+        let new_node_index = nodes.len();
+        let base_node_index = processing_transforms_base_node_indices[i];
+        let new_node = trs[index_last_collision_free];
+
+        nodes.push(new_node);
+        edges.push((base_node_index, new_node_index));
+
+        n_coll_free += 1;
+        n_coll_free_steps += index_last_collision_free + 1;
+        max_coll_free_steps = max_coll_free_steps.max(index_last_collision_free + 1);
+    }
+    println!(
+        "Collision free: {:.2}%; Avg number of steps of collision free: {:.2}; Max: {max_coll_free_steps}",
+        n_coll_free as f32 / processing_transforms_base_node_indices.len() as f32 * 100.,
+        n_coll_free_steps as f32 / n_coll_free as f32
+    )
+}
+
+fn show_collision_statistics(collisions: &[u8]) {
+    let collision_free = collisions.iter().filter(|x| **x == 0).count();
+    let collision_obj_1 = collisions.iter().filter(|x| **x == 1).count();
+    let collision_obj_2 = collisions.iter().filter(|x| **x == 2).count();
+    let collision_plane = collisions.iter().filter(|x| **x == 254).count();
+    let n_f64 = collisions.len() as f64;
+    println!(
+        "GPU Collisions: {:.2}% free; {:.2}% with object 1; {:.2}% with object 2; {:.2}% with ground plane",
+        collision_free as f64 / n_f64 * 100.,
+        collision_obj_1 as f64 / n_f64 * 100.,
+        collision_obj_2 as f64 / n_f64 * 100.,
+        collision_plane as f64 / n_f64 * 100.
+    );
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -411,41 +558,53 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         voxel_grid: task.grid_static,
     };
 
+    let mut gpu_buffers = glue::setup_gpu(&static_info, N);
+
     let mut rng_source =
         probability::source::Default::new([3589646354398292094, 6717470606376064352]);
 
-    const N: usize = 10240 * 2;
-    let mut gpu_input_buffer_cpu = [TransformQuat::default(); N];
-    let mut gpu_output_buffer_cpu = [255_u8; N];
+    const N: usize = 5120 * 4;
+    let mut gpu_input_buffer_cpu = vec![TransformQuat::default(); N];
+    let mut gpu_output_buffer_cpu = vec![255_u8; N];
+    let mut currently_processing_base_node_indices =
+        vec![0_usize; N / config.rrt_info.n_interp_steps];
 
-    random_sampling(
-        &transform_from_obj,
+    let mut nodes = vec![TransformQuat::from_transform(&transform_from_obj)];
+    let mut edges: Vec<(usize, usize)> = Vec::new();
+    let rrt_info = config.rrt_info;
+
+    rrt(
+        &nodes,
+        &rrt_info,
         &mut gpu_input_buffer_cpu,
-        0.01745,
-        0.0005,
+        &mut currently_processing_base_node_indices,
         &mut rng_source,
     );
 
-    let mut device_buffers = glue::setup_gpu(&static_info, N);
+    // random_sampling(
+    //     &transform_from_obj,
+    //     &mut gpu_input_buffer_cpu,
+    //     0.1396.,
+    //     0.004.,
+    //     &mut rng_source,
+    // );
 
     glue::gpu_driver(
-        &mut device_buffers,
+        &mut gpu_buffers,
         &gpu_input_buffer_cpu,
         &mut gpu_output_buffer_cpu,
     );
 
-    let collision_free = gpu_output_buffer_cpu.iter().filter(|x| **x == 0).count();
-    let collision_obj_1 = gpu_output_buffer_cpu.iter().filter(|x| **x == 1).count();
-    let collision_obj_2 = gpu_output_buffer_cpu.iter().filter(|x| **x == 2).count();
-    let collision_plane = gpu_output_buffer_cpu.iter().filter(|x| **x == 254).count();
-    let n_f64 = N as f64;
-    println!(
-        "GPU Collisions: {:.2}% free; {:.2}% with object 1; {:.2}% with object 2; {:.2}% with ground plane",
-        collision_free as f64 / n_f64 * 100.,
-        collision_obj_1 as f64 / n_f64 * 100.,
-        collision_obj_2 as f64 / n_f64 * 100.,
-        collision_plane as f64 / n_f64 * 100.
+    process_rrt_results(
+        &gpu_input_buffer_cpu,
+        &gpu_output_buffer_cpu,
+        &mut nodes,
+        &mut edges,
+        &currently_processing_base_node_indices,
+        rrt_info.n_interp_steps,
     );
+
+    show_collision_statistics(&gpu_output_buffer_cpu);
 
     Ok(())
 }
@@ -524,7 +683,8 @@ mod test {
         let tq2 = TransformQuat::from_transform(&Transform::from_homogeneous_and_scale(m2, scale));
         let tq3 = TransformQuat::from_transform(&Transform::from_homogeneous_and_scale(m3, scale));
 
-        let interps: [TransformQuat; 3] = tq0.interpolate(&tq3);
+        let mut interps = [TransformQuat::default(); 3];
+        tq0.interpolate(&tq3, &mut interps);
 
         for (i, (interp, sol)) in interps.iter().zip([tq1, tq2, tq3]).enumerate() {
             for (j, (q_interp, q_sol)) in interp.q.0.iter().zip(sol.q.0.iter()).enumerate() {

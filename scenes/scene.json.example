@@ -63,6 +63,26 @@
             1,
             0
         ]
-    ]
-]
+    ],    
+    "rrt_info": {
+        "angle_distance_tradeoff": 0.028648,
+        "pos_bounds": {
+            "min": [
+                -7.5,
+                -25,
+                0.06
+            ],
+            "max": [
+                7.5,
+                25,
+                0.18
+            ]
+        },
+        "step_size": {
+            "angle": 0.1748,
+            "distance": 0.01
+        },
+        "n_interp_steps": 10
+    }
+
 }

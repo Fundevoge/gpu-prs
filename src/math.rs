@@ -1,4 +1,7 @@
+use std::array;
+
 use cust::DeviceCopy;
+use probability::prelude::Sample as _;
 
 #[repr(C)]
 #[derive(Clone, Copy, Default, Debug, DeviceCopy, Hash, PartialEq, Eq)]
@@ -110,6 +113,10 @@ impl Vec3 {
         self.0[2] *= scale;
         self
     }
+
+    pub fn euclidean_distance(self, other: Vec3) -> f32 {
+        self.subtract(other).norm()
+    }
 }
 
 #[repr(C)]
@@ -158,6 +165,18 @@ impl Vec4 {
         self
     }
 
+    pub fn random_quat(
+        source: &mut impl probability::source::Source,
+        angle_distribution: &impl probability::distribution::Sample<Value = f64>,
+    ) -> Self {
+        let std_normal: probability::distribution::Gaussian =
+            probability::distribution::Gaussian::default();
+        // Sample random axis (point on 2d sphere) + random angle
+        let random_axis = Vec3(array::from_fn(|_| std_normal.sample(source) as f32)).normalize();
+        let random_angle = angle_distribution.sample(source);
+        Vec4::quat_from_unit_axis_angle(random_axis, random_angle)
+    }
+
     pub fn quat_from_unit_axis_angle(axis: Vec3, angle: f64) -> Self {
         let quat_angle = angle / 2.;
         let w = quat_angle.cos() as f32;
@@ -175,6 +194,13 @@ impl Vec4 {
 
         Vec4([w, x, y, z])
     }
+
+    pub fn quat_relative_angle(self, other: Self) -> f32 {
+        let [w1, x1, y1, z1] = self.0;
+        let [w2, x2, y2, z2] = other.0;
+        let w_rel = w1 * w2 + x1 * x2 + y1 * y2 + z1 * z2;
+        2.0 * w_rel.abs().clamp(0.0, 1.0).acos()
+    }
 }
 
 pub fn scalar_product<'a>(
@@ -185,20 +211,19 @@ pub fn scalar_product<'a>(
 }
 
 pub fn slerp(q0: Vec4, q1: Vec4, t: f32) -> Vec4 {
-    let mut dot = q0.dot(q1);
+    let dot = q0.dot(q1);
 
-    let mut q1_mod = q1;
+    let (q1, dot) = if dot >= 0.0 {
+        (q1, dot)
+    } else {
+        (q1.scale(-1.0), -dot)
+    };
 
     // Ensure shortest path
-    if dot < 0.0 {
-        q1_mod = q1_mod.scale(-1.0);
-        dot = -dot;
-    }
-
     const DOT_THRESHOLD: f32 = 0.9995;
     if dot > DOT_THRESHOLD {
         // Use LERP and normalize
-        let lerped = q0.scale(1.0 - t).add(q1_mod.scale(t));
+        let lerped = q0.scale(1.0 - t).add(q1.scale(t));
         return lerped.normalize();
     }
 
@@ -211,5 +236,9 @@ pub fn slerp(q0: Vec4, q1: Vec4, t: f32) -> Vec4 {
     let s0 = (theta_0 - theta).sin() / sin_theta_0;
     let s1 = sin_theta / sin_theta_0;
 
-    q0.scale(s0).add(q1_mod.scale(s1))
+    q0.scale(s0).add(q1.scale(s1))
+}
+
+pub fn lerp(p0: Vec3, p1: Vec3, t: f32) -> Vec3 {
+    p0.scale(1.0 - t).add(p1.scale(t))
 }
