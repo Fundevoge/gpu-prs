@@ -31,14 +31,10 @@ extern "C" __global__ void run_task_kernel(TransformQuat *obj_transforms, uint8_
                 static_cast<int32_t>(roundf(location_in_x.data[2])),
             };
 
-            if (indices_in_x[0] <= 0 || indices_in_x[0] >= static_info->voxel_grid.dims.x ||
-                indices_in_x[1] <= 0 || indices_in_x[1] >= static_info->voxel_grid.dims.y ||
-                indices_in_x[2] <= 0 || indices_in_x[2] >= static_info->voxel_grid.dims.z)
-            {
-                continue;
-            }
-
-            if (static_info->voxel_grid.at(
+            if (indices_in_x[0] >= 0 && indices_in_x[0] < static_info->voxel_grid.dims.x &&
+                indices_in_x[1] >= 0 && indices_in_x[1] < static_info->voxel_grid.dims.y &&
+                indices_in_x[2] >= 0 && indices_in_x[2] < static_info->voxel_grid.dims.z &&
+                static_info->voxel_grid.at(
                     static_cast<uint32_t>(indices_in_x[0]),
                     static_cast<uint32_t>(indices_in_x[1]),
                     static_cast<uint32_t>(indices_in_x[2])) == 1)
@@ -56,14 +52,10 @@ extern "C" __global__ void run_task_kernel(TransformQuat *obj_transforms, uint8_
                 static_cast<int32_t>(roundf(location_in_x.data[2])),
             };
 
-            if (indices_in_x[0] < 0 || indices_in_x[0] >= static_info->voxel_grid.dims.x ||
-                indices_in_x[1] < 0 || indices_in_x[1] >= static_info->voxel_grid.dims.y ||
-                indices_in_x[2] < 0 || indices_in_x[2] >= static_info->voxel_grid.dims.z)
-            {
-                continue;
-            }
-
-            if (static_info->voxel_grid.at(
+            if (indices_in_x[0] >= 0 && indices_in_x[0] < static_info->voxel_grid.dims.x &&
+                indices_in_x[1] >= 0 && indices_in_x[1] < static_info->voxel_grid.dims.y &&
+                indices_in_x[2] >= 0 && indices_in_x[2] < static_info->voxel_grid.dims.z &&
+                static_info->voxel_grid.at(
                     static_cast<uint32_t>(indices_in_x[0]),
                     static_cast<uint32_t>(indices_in_x[1]),
                     static_cast<uint32_t>(indices_in_x[2])) == 1)

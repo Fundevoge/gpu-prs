@@ -1,7 +1,7 @@
 use cust::DeviceCopy;
 
 #[repr(C)]
-#[derive(Clone, Copy, Default, Debug, DeviceCopy)]
+#[derive(Clone, Copy, Default, Debug, DeviceCopy, Hash, PartialEq, Eq)]
 pub struct U32_3 {
     pub x: u32,
     pub y: u32,
@@ -49,6 +49,26 @@ impl Matrix3 {
             new.0[i] = scalar_product(self.0[i].iter(), v.0.iter());
         }
         new
+    }
+
+    pub fn multiply_mat_from_right(&self, m: &Matrix3) -> Matrix3 {
+        let mut new = Matrix3::default();
+        for i in 0..3 {
+            for j in 0..3 {
+                new.0[i][j] = scalar_product(self.0[i].iter(), m.0.iter().map(|row| &row[j]));
+            }
+        }
+        new
+    }
+
+    pub fn from_34(matrix34: &Matrix34) -> Self {
+        let mut res = Self::default();
+        for i in 0..3 {
+            for j in 0..3 {
+                res.0[i][j] = matrix34.0[i][j];
+            }
+        }
+        res
     }
 }
 

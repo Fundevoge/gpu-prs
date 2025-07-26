@@ -109,6 +109,17 @@ impl Transform {
         self.matrix.multiply_vec_from_right(v)
     }
 
+    fn and_then(&self, other: &Transform) -> Transform {
+        let r_1 = Matrix3::from_34(&self.matrix);
+        let r_2 = Matrix3::from_34(&other.matrix);
+        let t_1 = self.homogeneous_translation();
+        let t_2 = other.homogeneous_translation();
+        Self::homogeneous_from_r_t(
+            r_2.multiply_mat_from_right(&r_1),
+            r_2.multiply_vec_from_right(&t_1).add(t_2),
+        )
+    }
+
     fn from_homogeneous_and_scale(mut matrix: Matrix34, scale: f32) -> Self {
         for i in 0..3 {
             for j in 0..3 {
@@ -276,18 +287,15 @@ fn run_task(task: &mut Task) {
             location_in_x.0[1].round() as i32,
             location_in_x.0[2].round() as i32,
         ];
-        if !indices_in_x
+        if indices_in_x
             .iter()
             .zip(task.grid_static.dims.as_array().iter())
             .all(|(i_x, d_x)| *i_x >= 0 && *i_x < (*d_x as i32))
-        {
-            continue;
-        }
-        if task.grid_static[(
-            indices_in_x[0] as u32,
-            indices_in_x[1] as u32,
-            indices_in_x[2] as u32,
-        )] == 1
+            && task.grid_static[(
+                indices_in_x[0] as u32,
+                indices_in_x[1] as u32,
+                indices_in_x[2] as u32,
+            )] == 1
         {
             unsafe { *task.out_collision = 1 };
             return;
@@ -299,18 +307,15 @@ fn run_task(task: &mut Task) {
             location_in_x.0[1].round() as i32,
             location_in_x.0[2].round() as i32,
         ];
-        if !indices_in_x
+        if indices_in_x
             .iter()
             .zip(task.grid_static.dims.as_array().iter())
             .all(|(i_x, d_x)| *i_x >= 0 && *i_x < (*d_x as i32))
-        {
-            continue;
-        }
-        if task.grid_static[(
-            indices_in_x[0] as u32,
-            indices_in_x[1] as u32,
-            indices_in_x[2] as u32,
-        )] == 1
+            && task.grid_static[(
+                indices_in_x[0] as u32,
+                indices_in_x[1] as u32,
+                indices_in_x[2] as u32,
+            )] == 1
         {
             unsafe { *task.out_collision = 2 };
             return;
@@ -416,8 +421,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     random_sampling(
         &transform_from_obj,
         &mut gpu_input_buffer_cpu,
-        0.005,
-        0.0001,
+        0.01745,
+        0.0005,
         &mut rng_source,
     );
 
@@ -425,16 +430,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     glue::gpu_driver(
         &mut device_buffers,
-        &gpu_input_buffer_cpu, // &[TransformQuat::from_transform(&transform_from_obj)],
+        &gpu_input_buffer_cpu,
         &mut gpu_output_buffer_cpu,
     );
-    println!("GPU returned collision {gpu_output_buffer_cpu:?}");
+
+    let collision_free = gpu_output_buffer_cpu.iter().filter(|x| **x == 0).count();
+    let collision_obj_1 = gpu_output_buffer_cpu.iter().filter(|x| **x == 1).count();
+    let collision_obj_2 = gpu_output_buffer_cpu.iter().filter(|x| **x == 2).count();
+    let collision_plane = gpu_output_buffer_cpu.iter().filter(|x| **x == 254).count();
+    let n_f64 = N as f64;
+    println!(
+        "GPU Collisions: {:.2}% free; {:.2}% with object 1; {:.2}% with object 2; {:.2}% with ground plane",
+        collision_free as f64 / n_f64 * 100.,
+        collision_obj_1 as f64 / n_f64 * 100.,
+        collision_obj_2 as f64 / n_f64 * 100.,
+        collision_plane as f64 / n_f64 * 100.
+    );
 
     Ok(())
 }
 
 #[cfg(test)]
 mod test {
+    use std::collections::HashSet;
+
     use super::*;
 
     fn quat_to_rot_matrix(q: &Vec4) -> Matrix3 {
@@ -532,5 +551,143 @@ mod test {
                 interp.scale, sol.scale
             );
         }
+    }
+
+    #[test]
+    fn test_transform_inverse() {
+        let m = Matrix34([
+            [0.99884413, -0.00170316, 0.04803638, 1.],
+            [0.00386124, -0.9932992, -0.11550674, 2.],
+            [0.04791122, 0.11555871, -0.9921445, 3.],
+        ]);
+        let d = Transform::from_homogeneous_and_scale(m, 5.);
+        let should_be_identity = d.and_then(&d.inverse());
+        for i in 0..3 {
+            for j in 0..3 {
+                if i == j {
+                    assert!(
+                        (should_be_identity.matrix.0[i][j] - 1.).abs() < 5e-5,
+                        "Matrix (R) at index {i} {j} should be 1 but is {:.3}",
+                        should_be_identity.matrix.0[i][j]
+                    );
+                } else {
+                    assert!(
+                        should_be_identity.matrix.0[i][j].abs() < 5e-5,
+                        "Matrix (R) at index {i} {j} should be 0 but is {:.3}",
+                        should_be_identity.matrix.0[i][j]
+                    );
+                }
+            }
+            assert!(
+                should_be_identity.matrix.0[i][3].abs() < 5e-5,
+                "Matrix (T) at index {i} should be 0 but is {:.3}",
+                should_be_identity.matrix.0[i][3]
+            );
+        }
+    }
+
+    #[test]
+    fn test_index_list_voxel_grid_identity() {
+        let config = load_json_config("./scenes/scene_1.json").unwrap();
+        let (voxel_data, dims) = read_voxel_data(&config.voxel_grid_fixed_path).unwrap();
+
+        let data = voxel_data.leak().as_ptr();
+        let grid = VoxelGrid { data, dims };
+        let index_list = read_index_list(&config.voxel_grid_obj_path).unwrap();
+
+        for idx in 0..index_list.len() as usize {
+            let U32_3 { x, y, z } = unsafe { *index_list.as_ptr().wrapping_add(idx) };
+            if grid[(x, y, z)] != 1 {
+                panic!("Mismatch between index list and Voxel grid at index {x} {y} {z}");
+            }
+        }
+
+        let index_set: HashSet<U32_3> = HashSet::from_iter(index_list);
+        for x in 0..dims.x {
+            for y in 0..dims.y {
+                for z in 0..dims.z {
+                    if grid[(x, y, z)] == 1 && !index_set.contains(&U32_3 { x, y, z }) {
+                        panic!(
+                            "Mismatch between Voxel grid and index list at index {x} {y} {z} (index set does not have index)"
+                        );
+                    }
+                    if grid[(x, y, z)] == 0 && index_set.contains(&U32_3 { x, y, z }) {
+                        panic!(
+                            "Mismatch between Voxel grid and index list at index {x} {y} {z} (index set has spurious index)"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[allow(non_snake_case)]
+    fn test_projected_indices(task: &mut Task) {
+        let o_D_obj = task.transform_from_obj;
+        for idx in 0..task.num_indices as usize {
+            let U32_3 { x, y, z } = unsafe { *task.index_list_obj.wrapping_add(idx) };
+
+            let idx_coords_o = o_D_obj.apply(&Vec3([x as f32, y as f32, z as f32]));
+
+            let location_in_1 = task.transform_into_1.apply(&idx_coords_o);
+
+            let relative_indices_in_1 = [
+                location_in_1.0[0].round() as i32 - x as i32,
+                location_in_1.0[1].round() as i32 - y as i32,
+                location_in_1.0[2].round() as i32 - z as i32,
+            ];
+
+            let location_in_2 = task.transform_into_2.apply(&idx_coords_o);
+
+            let relative_indices_in_2 = [
+                location_in_2.0[0].round() as i32 - x as i32,
+                location_in_2.0[1].round() as i32 - y as i32,
+                location_in_2.0[2].round() as i32 - z as i32,
+            ];
+
+            for u in 0..3 {
+                if relative_indices_in_1[u] != -relative_indices_in_2[u] {
+                    panic!(
+                        "Relative indices do not match for {x} {y} {z}; {u}: {relative_indices_in_1:?} vs {relative_indices_in_2:?}"
+                    )
+                }
+            }
+        }
+
+        unsafe { *task.out_collision = 0 };
+    }
+
+    #[test]
+    fn test_equal_projection() {
+        let config = load_json_config("./scenes/scene_1.json").unwrap();
+
+        let scale = config.o_S_x;
+
+        let static_transforms: Vec<_> = config
+            .o_Ds_x
+            .into_iter()
+            .map(|matrix| Transform::from_homogeneous_and_scale(Matrix34(matrix), scale).inverse())
+            .collect();
+        let transform_from_obj =
+            Transform::from_homogeneous_and_scale(Matrix34(config.o_D_obj), scale);
+
+        let (voxel_data, dims) = read_voxel_data(&config.voxel_grid_fixed_path).unwrap();
+
+        let data = voxel_data.leak().as_ptr();
+        let grid = VoxelGrid { data, dims };
+
+        let index_list = read_index_list(&config.voxel_grid_obj_path).unwrap();
+
+        let mut collision: u8 = 255;
+        let mut task = Task {
+            out_collision: &mut collision,
+            grid_static: grid,
+            index_list_obj: index_list.as_ptr(),
+            num_indices: index_list.len() as u32,
+            transform_into_1: static_transforms[0],
+            transform_into_2: static_transforms[1],
+            transform_from_obj,
+        };
+        test_projected_indices(&mut task);
     }
 }
