@@ -2,6 +2,7 @@ use std::array;
 
 use cust::DeviceCopy;
 use probability::prelude::Sample as _;
+use serde::{Deserialize, Serialize};
 
 #[repr(C)]
 #[derive(Clone, Copy, Default, Debug, DeviceCopy, Hash, PartialEq, Eq)]
@@ -28,7 +29,7 @@ impl U32_3 {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Default, DeviceCopy)]
+#[derive(Clone, Copy, Default, DeviceCopy, Debug, Deserialize, Serialize)]
 pub struct Matrix34(pub [[f32; 4]; 3]);
 
 impl Matrix34 {
@@ -38,6 +39,10 @@ impl Matrix34 {
             new.0[i] = scalar_product(self.0[i].iter(), v.0.iter()) + self.0[i][3];
         }
         new
+    }
+
+    pub fn last_column(&self) -> Vec3 {
+        Vec3([self.0[0][3], self.0[1][3], self.0[2][3]])
     }
 }
 
@@ -64,6 +69,26 @@ impl Matrix3 {
         new
     }
 
+    pub fn from_quat(q: Vec4) -> Self {
+        Matrix3([
+            [
+                1. - 2. * (q.0[2] * q.0[2] + q.0[3] * q.0[3]),
+                2. * (q.0[1] * q.0[2] - q.0[3] * q.0[0]),
+                2. * (q.0[1] * q.0[3] + q.0[2] * q.0[0]),
+            ],
+            [
+                2. * (q.0[1] * q.0[2] + q.0[3] * q.0[0]),
+                1. - 2. * (q.0[1] * q.0[1] + q.0[3] * q.0[3]),
+                2. * (q.0[2] * q.0[3] - q.0[1] * q.0[0]),
+            ],
+            [
+                2. * (q.0[1] * q.0[3] - q.0[2] * q.0[0]),
+                2. * (q.0[2] * q.0[3] + q.0[1] * q.0[0]),
+                1. - 2. * (q.0[1] * q.0[1] + q.0[2] * q.0[2]),
+            ],
+        ])
+    }
+
     pub fn from_34(matrix34: &Matrix34) -> Self {
         let mut res = Self::default();
         for i in 0..3 {
@@ -72,6 +97,19 @@ impl Matrix3 {
             }
         }
         res
+    }
+
+    pub fn from_34_normalized(matrix34: &Matrix34) -> (Self, f32) {
+        let scale: f32 =
+            scalar_product(matrix34.0[0][0..3].iter(), matrix34.0[0][0..3].iter()).sqrt();
+
+        let mut res = Self::default();
+        for i in 0..3 {
+            for j in 0..3 {
+                res.0[i][j] = matrix34.0[i][j] / scale;
+            }
+        }
+        (res, scale)
     }
 }
 
@@ -200,6 +238,24 @@ impl Vec4 {
         let [w2, x2, y2, z2] = other.0;
         let w_rel = w1 * w2 + x1 * x2 + y1 * y2 + z1 * z2;
         2.0 * w_rel.abs().clamp(0.0, 1.0).acos()
+    }
+
+    pub fn quat_from_rotation_matrix(matrix: Matrix3) -> Self {
+        let cos_theta = (matrix.0[0][0] + matrix.0[1][1] + matrix.0[2][2] - 1.) / 2.;
+        let theta = cos_theta.clamp(-1., 1.).acos();
+        let axis = Vec3([
+            matrix.0[2][1] - matrix.0[1][2],
+            matrix.0[0][2] - matrix.0[2][0],
+            matrix.0[1][0] - matrix.0[0][1],
+        ]);
+        let axis_norm = axis.norm();
+        let axis = if axis_norm > 5e-5 {
+            axis.scale((theta / 2.).sin() / axis_norm)
+        } else {
+            Vec3::default()
+        };
+
+        Vec4([(theta / 2.).cos(), axis.0[0], axis.0[1], axis.0[2]])
     }
 }
 

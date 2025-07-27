@@ -1,3 +1,4 @@
 /target
 scenes/*.json
 kernel/*.ptx
+scenes/*.mp4

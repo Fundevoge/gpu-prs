@@ -1,5 +1,12 @@
 use core::{f64, slice};
-use std::{array, fs::File, io::Read, ops::Index, path::Path, time::Instant};
+use std::{
+    array,
+    fs::File,
+    io::{Read, Write},
+    ops::Index,
+    path::Path,
+    time::Instant,
+};
 
 use cust::DeviceCopy;
 use npyz::NpyFile;
@@ -17,7 +24,7 @@ struct Config {
     voxel_grid_obj_path: String,
     voxel_grid_fixed_path: String,
     o_S_x: f32,
-    o_D_obj: [[f32; 4]; 3],
+    o_D_obj: Matrix34,
     o_Ds_x: Vec<[[f32; 4]; 3]>,
     rrt_info: RRTInfo,
 }
@@ -37,6 +44,11 @@ struct RRTInfo {
     pos_bounds: Bounds,
     step_size: StepSize,
     n_interp_steps: usize,
+    target: Matrix34,
+    target_angle_disturbance: f64,
+    target_distance_disturbance: f64,
+    combinded_distance_success_threshold: f32,
+    n_target_attempts: usize,
 }
 
 fn load_json_config<P: AsRef<Path>>(path: P) -> Result<Config, Box<dyn std::error::Error>> {
@@ -45,6 +57,15 @@ fn load_json_config<P: AsRef<Path>>(path: P) -> Result<Config, Box<dyn std::erro
     file.read_to_string(&mut contents)?;
     let config: Config = serde_json::from_str(&contents)?;
     Ok(config)
+}
+
+fn write_json_results<P: AsRef<Path>>(
+    path: P,
+    contents: String,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut file = File::create(path)?;
+    file.write_all(contents.as_bytes())?;
+    Ok(())
 }
 
 fn read_voxel_data<P: AsRef<Path>>(
@@ -132,7 +153,7 @@ impl Transform {
         let r_2 = Matrix3::from_34(&other.matrix);
         let t_1 = self.homogeneous_translation();
         let t_2 = other.homogeneous_translation();
-        Self::homogeneous_from_r_t(
+        Self::from_r_t(
             r_2.multiply_mat_from_right(&r_1),
             r_2.multiply_vec_from_right(&t_1).add(t_2),
         )
@@ -155,11 +176,22 @@ impl Transform {
         ])
     }
 
-    fn homogeneous_from_r_t(rotation: Matrix3, translation: Vec3) -> Self {
+    fn from_r_t(rotation: Matrix3, translation: Vec3) -> Self {
         let mut matrix = Matrix34::default();
         for i in 0..3 {
             for j in 0..3 {
                 matrix.0[i][j] = rotation.0[i][j];
+            }
+            matrix.0[i][3] = translation.0[i];
+        }
+        Self { matrix }
+    }
+
+    fn from_r_t_scale(rotation: Matrix3, translation: Vec3, scale: f32) -> Self {
+        let mut matrix = Matrix34::default();
+        for i in 0..3 {
+            for j in 0..3 {
+                matrix.0[i][j] = rotation.0[i][j] * scale;
             }
             matrix.0[i][3] = translation.0[i];
         }
@@ -181,7 +213,11 @@ impl Transform {
         let new_translation =
             new_rotation_matrix.multiply_vec_from_right(&self.homogeneous_translation().inverse());
 
-        Transform::homogeneous_from_r_t(new_rotation_matrix, new_translation)
+        Transform::from_r_t(new_rotation_matrix, new_translation)
+    }
+
+    fn from_transform_quat_unit_scale(t: TransformQuat) -> Self {
+        Self::from_r_t(Matrix3::from_quat(t.q), t.t)
     }
 }
 
@@ -195,34 +231,11 @@ struct TransformQuat {
 
 impl TransformQuat {
     fn from_transform(transform: &Transform) -> Self {
-        let scale: f32 = math::scalar_product(
-            transform.matrix.0[0][0..3].iter(),
-            transform.matrix.0[0][0..3].iter(),
-        )
-        .sqrt();
-        let cos_theta =
-            ((transform.matrix.0[0][0] + transform.matrix.0[1][1] + transform.matrix.0[2][2])
-                / scale
-                - 1.)
-                / 2.;
-        let theta = cos_theta.clamp(-1., 1.).acos();
-        let axis = Vec3([
-            transform.matrix.0[2][1] - transform.matrix.0[1][2],
-            transform.matrix.0[0][2] - transform.matrix.0[2][0],
-            transform.matrix.0[1][0] - transform.matrix.0[0][1],
-        ]);
-        let axis_norm = axis.norm();
-        let axis = if axis_norm > 5e-5 {
-            axis.scale((theta / 2.).sin() / axis_norm)
-        } else {
-            Vec3::default()
-        };
-
-        let q = Vec4([(theta / 2.).cos(), axis.0[0], axis.0[1], axis.0[2]]);
+        let (rotation_matrix, scale) = Matrix3::from_34_normalized(&transform.matrix);
 
         Self {
             t: transform.homogeneous_translation(),
-            q,
+            q: Vec4::quat_from_rotation_matrix(rotation_matrix),
             scale,
         }
     }
@@ -232,6 +245,11 @@ impl TransformQuat {
             self.t.euclidean_distance(point),
             self.q.quat_relative_angle(quat),
         )
+    }
+
+    fn combined_distance(&self, other: &TransformQuat, angle_distance_tradeoff: f32) -> f32 {
+        self.t.euclidean_distance(other.t)
+            + angle_distance_tradeoff * self.q.quat_relative_angle(other.q)
     }
 
     // Assumes equal scale; will use self.scale
@@ -350,13 +368,12 @@ fn run_task(task: &mut Task) {
 }
 
 fn random_sampling(
-    transform_from_obj: &Transform,
+    base_transform_quat: &TransformQuat,
     out_buffer: &mut [TransformQuat],
     max_angle: f64,
     max_distance: f64,
     source: &mut impl probability::source::Source,
 ) {
-    let base_transform_quat = TransformQuat::from_transform(transform_from_obj);
     let base_quat = base_transform_quat.q;
     let base_vec = base_transform_quat.t;
 
@@ -387,6 +404,7 @@ fn rrt(
     info: &RRTInfo,
     out_buffer: &mut [TransformQuat],
     out_index_buffer: &mut [usize],
+    sample_buffer: &mut [TransformQuat],
     source: &mut impl probability::source::Source,
 ) {
     assert!(
@@ -402,8 +420,32 @@ fn rrt(
         out_index_buffer.len(),
         info.n_interp_steps,
     );
+    assert!(
+        out_buffer.len() / info.n_interp_steps == sample_buffer.len(),
+        "Output buffer size {} and Sample buffer size {} should be related by number of interpolation steps {}",
+        out_buffer.len(),
+        out_index_buffer.len(),
+        info.n_interp_steps,
+    );
     assert!(!nodes.is_empty(), "At least one starting node is necesary.");
+    assert!(
+        info.n_target_attempts != 0,
+        "One attempt should be reserved for reaching the target directly"
+    );
 
+    // Add n_target_attempts samples near target within angle/distance
+    let target_transform = Transform::from_homogeneous_and_scale(info.target, nodes[0].scale);
+    let target_transform_quat = TransformQuat::from_transform(&target_transform);
+    sample_buffer[0] = target_transform_quat;
+    random_sampling(
+        &target_transform_quat,
+        &mut sample_buffer[1..info.n_target_attempts],
+        info.target_angle_disturbance,
+        info.target_distance_disturbance,
+        source,
+    );
+
+    // Fill with random samples
     let angle_distribution_uniform_full =
         Uniform::new(-f64::consts::PI + 1e-4, f64::consts::PI - 1e-4);
     let point_dists = [
@@ -411,16 +453,26 @@ fn rrt(
         Uniform::new(info.pos_bounds.min[1] as f64, info.pos_bounds.max[1] as f64),
         Uniform::new(info.pos_bounds.min[2] as f64, info.pos_bounds.max[2] as f64),
     ];
-
-    for i in 0..(out_buffer.len() / info.n_interp_steps) {
-        // Sample
+    for s in &mut sample_buffer[info.n_target_attempts..] {
         let random_quat = Vec4::random_quat(source, &angle_distribution_uniform_full);
         let random_point = Vec3(array::from_fn(|i| point_dists[i].sample(source) as f32));
+        *s = TransformQuat {
+            scale: nodes[0].scale,
+            t: random_point,
+            q: random_quat,
+        }
+    }
+
+    for (sample, (out_index, out_slice)) in sample_buffer.iter().zip(
+        out_index_buffer
+            .iter_mut()
+            .zip(out_buffer.chunks_mut(info.n_interp_steps)),
+    ) {
         // Find nearest
         let (idx_min_node, min_node, (d_r, d_phi)) = nodes
             .iter()
             .enumerate()
-            .map(|(i, t)| (i, t, t.distances(random_point, random_quat)))
+            .map(|(i, t)| (i, t, t.distances(sample.t, sample.q)))
             .min_by(
                 |&(_i1, _t1, (d_r_1, d_phi_1)), &(_i2, _t2, (d_r_2, d_phi_2))| {
                     f32::total_cmp(
@@ -432,25 +484,25 @@ fn rrt(
             .unwrap();
         // Ensure maximum step size is respected
         let target_quat = if d_phi <= info.step_size.angle {
-            random_quat
+            sample.q
         } else {
-            math::slerp(min_node.q, random_quat, info.step_size.angle / d_phi)
+            math::slerp(min_node.q, sample.q, info.step_size.angle / d_phi)
         };
         let target_pos = if d_r <= info.step_size.distance {
-            random_point
+            sample.t
         } else {
-            math::lerp(min_node.t, random_point, info.step_size.distance / d_r)
+            math::lerp(min_node.t, sample.t, info.step_size.distance / d_r)
         };
 
         min_node.interpolate(
             &TransformQuat {
-                scale: min_node.scale,
                 t: target_pos,
                 q: target_quat,
+                ..*sample
             },
-            &mut out_buffer[i * info.n_interp_steps..(i + 1) * info.n_interp_steps],
+            out_slice,
         );
-        out_index_buffer[i] = idx_min_node;
+        *out_index = idx_min_node;
     }
 }
 
@@ -460,18 +512,34 @@ fn process_rrt_results(
     nodes: &mut Vec<TransformQuat>,
     edges: &mut Vec<(usize, usize)>,
     processing_transforms_base_node_indices: &[usize],
-    n_interp_steps: usize,
-) {
+    info: &RRTInfo,
+) -> bool {
+    // Note: scale is not set correctly as it is not necessary to compute the distance between transforms
+    let target_pose =
+        TransformQuat::from_transform(&Transform::from_homogeneous_and_scale(info.target, 1.0));
+    // Check n_target_samples: if any has no collision for last step and final step is close to target: mark as done
+    let done = collisions
+        .iter()
+        .zip(processed_transforms)
+        .skip(info.n_interp_steps - 1)
+        .step_by(info.n_interp_steps)
+        .take(info.n_target_attempts)
+        .any(|(c, t)| {
+            *c == 0
+                && t.combined_distance(&target_pose, info.angle_distance_tradeoff)
+                    <= info.combinded_distance_success_threshold
+        });
+
     let mut n_coll_free = 0;
     let mut n_coll_free_steps = 0;
     let mut max_coll_free_steps = 0;
     // Go through collisions in chunks of n_interp_steps
     // Filter for those with at least one valid step
     for (i, (colls, trs)) in collisions
-        .chunks(n_interp_steps)
-        .zip(processed_transforms.chunks(n_interp_steps))
-        .filter(|(c, _t)| c[0] == 0)
+        .chunks(info.n_interp_steps)
+        .zip(processed_transforms.chunks(info.n_interp_steps))
         .enumerate()
+        .filter(|(_i, (c, _t))| c[0] == 0)
     {
         // Count how many until collision
         let index_last_collision_free = colls.iter().skip(1).take_while(|c| **c == 0).count();
@@ -492,7 +560,102 @@ fn process_rrt_results(
         "Collision free: {:.2}%; Avg number of steps of collision free: {:.2}; Max: {max_coll_free_steps}",
         n_coll_free as f32 / processing_transforms_base_node_indices.len() as f32 * 100.,
         n_coll_free_steps as f32 / n_coll_free as f32
-    )
+    );
+
+    // Find nearest
+    let (idx_min_node, _min_node, (d_r, d_phi)) = nodes
+        .iter()
+        .enumerate()
+        .map(|(i, t)| (i, t, t.distances(target_pose.t, target_pose.q)))
+        .min_by(
+            |&(_i1, _t1, (d_r_1, d_phi_1)), &(_i2, _t2, (d_r_2, d_phi_2))| {
+                f32::total_cmp(
+                    &(d_r_1 + d_phi_1 * info.angle_distance_tradeoff),
+                    &(d_r_2 + d_phi_2 * info.angle_distance_tradeoff),
+                )
+            },
+        )
+        .unwrap();
+    println!(
+        "Nearest node is now {idx_min_node} with d={d_r:.6}, phi={d_phi:.6}, d_total={:.6}",
+        d_r + d_phi * info.angle_distance_tradeoff
+    );
+    let (idx_min_node, _min_node, d_r) = nodes
+        .iter()
+        .enumerate()
+        .map(|(i, t)| (i, t, t.distances(target_pose.t, target_pose.q).0))
+        .min_by(|&(_i1, _t1, d_1), &(_i2, _t2, d_2)| f32::total_cmp(&(d_1), &(d_2)))
+        .unwrap();
+    println!("Nearest node by distance is now {idx_min_node} with d={d_r:.6}");
+    let (idx_min_node, _min_node, d_phi) = nodes
+        .iter()
+        .enumerate()
+        .map(|(i, t)| (i, t, t.distances(target_pose.t, target_pose.q).1))
+        .min_by(|&(_i1, _t1, d_1), &(_i2, _t2, d_2)| f32::total_cmp(&(d_1), &(d_2)))
+        .unwrap();
+    println!("Nearest node by angle is now {idx_min_node} with d={d_phi:.6}");
+
+    let (idx_min_node, min_node) = nodes
+        .iter()
+        .enumerate()
+        .min_by(|&(_i1, t1), &(_i2, t2)| f32::total_cmp(&t2.t.0[2], &t1.t.0[2]))
+        .unwrap();
+    let mut path = vec![idx_min_node];
+    while !path.contains(&0) {
+        path.push(
+            edges
+                .iter()
+                .find(|(prev, curr)| curr == path.last().unwrap())
+                .map(|(prev, curr)| *prev)
+                .unwrap(),
+        );
+    }
+
+    println!(
+        "Highest z node is now {idx_min_node} with z={:.6}; x={:.6},y={:.6}, phi={:6}, path={:?}, R={:?}, t={:?}",
+        min_node.t.0[2],
+        min_node.t.0[0],
+        min_node.t.0[1],
+        min_node.q.quat_relative_angle(target_pose.q),
+        path,
+        Matrix3::from_quat(min_node.q).0,
+        min_node.t.0,
+    );
+
+    done
+}
+
+fn solving_trajectory(
+    info: &RRTInfo,
+    nodes: &[TransformQuat],
+    edges: &[(usize, usize)],
+) -> Vec<TransformQuat> {
+    let target_pose =
+        TransformQuat::from_transform(&Transform::from_homogeneous_and_scale(info.target, 1.0));
+    // find nearest
+    let idx_min_node = nodes
+        .iter()
+        .enumerate()
+        .min_by(|&(_i1, t1), &(_i2, t2)| {
+            f32::total_cmp(
+                &t1.combined_distance(&target_pose, info.angle_distance_tradeoff),
+                &t2.combined_distance(&target_pose, info.angle_distance_tradeoff),
+            )
+        })
+        .unwrap()
+        .0;
+    // go backwards
+    let mut path = vec![idx_min_node];
+    while !path.contains(&0) {
+        path.push(
+            edges
+                .iter()
+                .find(|(_prev, curr)| curr == path.last().unwrap())
+                .map(|(prev, _curr)| *prev)
+                .unwrap(),
+        );
+    }
+    path.iter().rev().map(|idx| nodes[*idx]).collect()
 }
 
 fn show_collision_statistics(collisions: &[u8]) {
@@ -522,7 +685,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .into_iter()
         .map(|matrix| Transform::from_homogeneous_and_scale(Matrix34(matrix), scale).inverse())
         .collect();
-    let transform_from_obj = Transform::from_homogeneous_and_scale(Matrix34(config.o_D_obj), scale);
+    let transform_from_obj = Transform::from_homogeneous_and_scale(config.o_D_obj, scale);
 
     let (voxel_data, dims) = read_voxel_data(&config.voxel_grid_fixed_path)?;
     println!("Voxel data dims: {dims:?}");
@@ -557,6 +720,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         num_indices: task.num_indices,
         voxel_grid: task.grid_static,
     };
+    let rrt_info = config.rrt_info;
 
     let mut gpu_buffers = glue::setup_gpu(&static_info, N);
 
@@ -566,45 +730,54 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     const N: usize = 5120 * 4;
     let mut gpu_input_buffer_cpu = vec![TransformQuat::default(); N];
     let mut gpu_output_buffer_cpu = vec![255_u8; N];
-    let mut currently_processing_base_node_indices =
-        vec![0_usize; N / config.rrt_info.n_interp_steps];
+    let mut currently_processing_base_node_indices = vec![0_usize; N / rrt_info.n_interp_steps];
 
     let mut nodes = vec![TransformQuat::from_transform(&transform_from_obj)];
     let mut edges: Vec<(usize, usize)> = Vec::new();
-    let rrt_info = config.rrt_info;
+    let mut rrt_sample_buffer = vec![TransformQuat::default(); N / rrt_info.n_interp_steps];
 
-    rrt(
-        &nodes,
-        &rrt_info,
-        &mut gpu_input_buffer_cpu,
-        &mut currently_processing_base_node_indices,
-        &mut rng_source,
-    );
+    loop {
+        rrt(
+            &nodes,
+            &rrt_info,
+            &mut gpu_input_buffer_cpu,
+            &mut currently_processing_base_node_indices,
+            &mut rrt_sample_buffer,
+            &mut rng_source,
+        );
 
-    // random_sampling(
-    //     &transform_from_obj,
-    //     &mut gpu_input_buffer_cpu,
-    //     0.1396.,
-    //     0.004.,
-    //     &mut rng_source,
-    // );
+        glue::gpu_driver(
+            &mut gpu_buffers,
+            &gpu_input_buffer_cpu,
+            &mut gpu_output_buffer_cpu,
+        );
 
-    glue::gpu_driver(
-        &mut gpu_buffers,
-        &gpu_input_buffer_cpu,
-        &mut gpu_output_buffer_cpu,
-    );
+        let done = process_rrt_results(
+            &gpu_input_buffer_cpu,
+            &gpu_output_buffer_cpu,
+            &mut nodes,
+            &mut edges,
+            &currently_processing_base_node_indices,
+            &rrt_info,
+        );
+        println!("Done? {done}");
 
-    process_rrt_results(
-        &gpu_input_buffer_cpu,
-        &gpu_output_buffer_cpu,
-        &mut nodes,
-        &mut edges,
-        &currently_processing_base_node_indices,
-        rrt_info.n_interp_steps,
-    );
+        show_collision_statistics(&gpu_output_buffer_cpu);
+        if done {
+            break;
+        }
+    }
 
-    show_collision_statistics(&gpu_output_buffer_cpu);
+    let traj: Vec<Matrix34> = solving_trajectory(&rrt_info, &nodes, &edges)
+        .into_iter()
+        .map(Transform::from_transform_quat_unit_scale)
+        .map(|t| t.matrix)
+        .collect();
+    write_json_results(
+        "./scenes/scene_1_trajectory.json",
+        serde_json::to_string(&traj).unwrap(),
+    )
+    .unwrap();
 
     Ok(())
 }
@@ -828,8 +1001,7 @@ mod test {
             .into_iter()
             .map(|matrix| Transform::from_homogeneous_and_scale(Matrix34(matrix), scale).inverse())
             .collect();
-        let transform_from_obj =
-            Transform::from_homogeneous_and_scale(Matrix34(config.o_D_obj), scale);
+        let transform_from_obj = Transform::from_homogeneous_and_scale(config.o_D_obj, scale);
 
         let (voxel_data, dims) = read_voxel_data(&config.voxel_grid_fixed_path).unwrap();
 
